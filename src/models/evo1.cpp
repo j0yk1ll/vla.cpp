@@ -40,6 +40,8 @@
 #include <string>
 #include <vector>
 
+#include "/opt/nvidia/nsight-systems/2024.5.4/target-linux-tegra-armv8/nvtx/include/nvtx3/nvToolsExt.h"
+
 namespace vla {
 namespace {
 
@@ -146,10 +148,43 @@ ggml_tensor * build_qwen2_layer(ggml_context * C, const Evo1ModelArch & m, const
     ggml_tensor * Q = ggml_cont(C, ggml_permute(C, q_rope, 0, 2, 1, 3));
     ggml_tensor * K = ggml_cont(C, ggml_permute(C, k_rope, 0, 2, 1, 3));
     ggml_tensor * V = ggml_cont(C, ggml_permute(C, ggml_reshape_3d(C, vp, hd, n_kv, seq), 1, 2, 0, 3));
-    ggml_tensor * kq = ggml_mul_mat(C, K, Q); ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
-    ggml_tensor * aw = ggml_soft_max_ext(C, kq, mask, scale, 0.0f);
-    ggml_tensor * kqv = ggml_mul_mat(C, V, aw);
-    ggml_tensor * att = ggml_reshape_2d(C, ggml_cont(C, ggml_permute(C, kqv, 0, 2, 1, 3)), hq, seq);
+
+    ggml_tensor * att = nullptr;
+    const bool lm_fa =
+        std::getenv("VLA_EVO1_LM_FLASH_ATTN") != nullptr;
+
+    if (lm_fa) {
+        // Flash attention expects V in [hd, seq, n_kv, batch],
+        // unlike the explicit V*softmax path above, whose V is
+        // laid out [seq, hd, n_kv, batch].
+        //
+        // Keep vp F32: only the attention algorithm changes.
+        ggml_tensor * V_fa = ggml_cont(
+            C,
+            ggml_permute(
+                C,
+                ggml_reshape_3d(C, vp, hd, n_kv, seq),
+                0, 2, 1, 3));
+
+        ggml_tensor * fa =
+            ggml_flash_attn_ext(
+                C, Q, K, V_fa, mask, scale, 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(fa, GGML_PREC_F32);
+
+        // FA result is [hd, n_q, seq, batch], contiguous in
+        // head dimension then head index, so flatten to [hq, seq].
+        att = ggml_reshape_2d(C, fa, hq, seq);
+    } else {
+        ggml_tensor * kq = ggml_mul_mat(C, K, Q);
+        ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
+        ggml_tensor * aw =
+            ggml_soft_max_ext(C, kq, mask, scale, 0.0f);
+        ggml_tensor * kqv = ggml_mul_mat(C, V, aw);
+        att = ggml_reshape_2d(
+            C,
+            ggml_cont(C, ggml_permute(C, kqv, 0, 2, 1, 3)),
+            hq, seq);
+    }
     ggml_tensor * attn_out = mm_act(C, w.Wo, as_type(C, att, at), at);
     if (qmask)
         attn_out = ggml_mul(C, attn_out, qmask);
@@ -391,6 +426,7 @@ bool load_config(const gguf_reader & g, Evo1ModelArch & m, Config & cfg) {
     cfg.real_action_dim= m.real_action_dim;
     cfg.norm_eps       = m.norm_eps_denom;
     cfg.num_steps      = (int) m.num_steps;
+
     cfg.rms_eps        = m.lm_rms_eps;
     cfg.rope_n_dims    = (int) m.lm_head_dim;
     cfg.rope_mode      = GGML_ROPE_TYPE_NEOX;
@@ -623,7 +659,10 @@ std::vector<float> Evo1ModelArch::predict(const Inputs& in) {
             ggml_backend_tensor_set(t_px[v], chw.data(), 0, ggml_nbytes(t_px[v]));
         }
         graph_unique_names(vg);
-        if (ggml_backend_graph_compute(backend, vg) != GGML_STATUS_SUCCESS) {
+        nvtxRangePushA("evo1.vision");
+        const ggml_status vision_st = ggml_backend_graph_compute(backend, vg);
+        nvtxRangePop();
+        if (vision_st != GGML_STATUS_SUCCESS) {
             std::fprintf(stderr, "vla(evo1): vision graph compute failed (%lld views)\n", (long long) n_views);
             return {};
         }
@@ -743,7 +782,11 @@ std::vector<float> Evo1ModelArch::predict(const Inputs& in) {
 
     ggml_tensor * t_embeds   = ggml_new_tensor_2d(C, GGML_TYPE_F32, lm_hidden, SEQ);     ggml_set_input(t_embeds);
     ggml_tensor * t_pos      = ggml_new_tensor_1d(C, GGML_TYPE_I32, SEQ);                ggml_set_input(t_pos);
-    ggml_tensor * t_lmmask   = ggml_new_tensor_2d(C, GGML_TYPE_F32, SEQ, SEQ);           ggml_set_input(t_lmmask);
+    const bool lm_fa =
+        std::getenv("VLA_EVO1_LM_FLASH_ATTN") != nullptr;
+    ggml_tensor * t_lmmask = ggml_new_tensor_2d(
+        C, lm_fa ? GGML_TYPE_F16 : GGML_TYPE_F32, SEQ, SEQ);
+    ggml_set_input(t_lmmask);
 
     ggml_tensor * t_qmask    = ggml_new_tensor_2d(C, GGML_TYPE_F32, 1, SEQ);              ggml_set_input(t_qmask);
     ggml_tensor * t_state    = ggml_new_tensor_1d(C, GGML_TYPE_F32, per_a);              ggml_set_input(t_state);
@@ -846,9 +889,27 @@ std::vector<float> Evo1ModelArch::predict(const Inputs& in) {
             pp[i] = (int32_t) i;
         ggml_backend_tensor_set(t_pos, pp.data(), 0, ggml_nbytes(t_pos));
     }
-    { std::vector<float> mk((size_t) SEQ * SEQ); const float NEG = -std::numeric_limits<float>::infinity();
-      for (int64_t q=0; q<SEQ; ++q) for (int64_t kv = 0; kv < SEQ; ++kv) mk[q * SEQ+kv] = (kv <= q && attn_ok[kv]) ? 0.0f : NEG;
-      ggml_backend_tensor_set(t_lmmask, mk.data(), 0, ggml_nbytes(t_lmmask)); }
+    {
+        std::vector<float> mk((size_t) SEQ * SEQ);
+        const float NEG = -std::numeric_limits<float>::infinity();
+        for (int64_t q = 0; q < SEQ; ++q)
+            for (int64_t kv = 0; kv < SEQ; ++kv)
+                mk[q * SEQ + kv] =
+                    (kv <= q && attn_ok[kv]) ? 0.0f : NEG;
+
+        if (t_lmmask->type == GGML_TYPE_F16) {
+            std::vector<ggml_fp16_t> mk16(mk.size());
+            ggml_fp32_to_fp16_row(
+                mk.data(), mk16.data(), (int64_t) mk.size());
+            ggml_backend_tensor_set(
+                t_lmmask, mk16.data(), 0,
+                mk16.size() * sizeof(ggml_fp16_t));
+        } else {
+            ggml_backend_tensor_set(
+                t_lmmask, mk.data(), 0,
+                mk.size() * sizeof(float));
+        }
+    }
     ggml_backend_tensor_set(t_state, state_norm.data(), 0, ggml_nbytes(t_state));
     ggml_backend_tensor_set(t_x, x_init.data(), 0, ggml_nbytes(t_x));
     { std::vector<float> am(per_a, 0.0f); for (int64_t i=0; i<real_action_dim && i<per_a; ++i) am[i] = 1.0f;
@@ -858,7 +919,9 @@ std::vector<float> Evo1ModelArch::predict(const Inputs& in) {
 
     graph_unique_names(gf);
     const auto tc0 = std::chrono::steady_clock::now();
+    nvtxRangePushA("evo1.inference");
     const ggml_status st = ggml_backend_graph_compute(backend, gf);
+    nvtxRangePop();
     const auto tc1 = std::chrono::steady_clock::now();
     if (st != GGML_STATUS_SUCCESS) {
         std::fprintf(stderr, "vla(evo1): ggml_backend_graph_compute failed (%d)\n", (int) st);
