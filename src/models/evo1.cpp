@@ -225,11 +225,48 @@ ggml_tensor * build_internvit_layer(ggml_context * C, const Evo1ModelArch & m, c
     const float scale = 1.0f/std::sqrt((float) hd);
     ggml_tensor * x_n1 = ggml_add(C, ggml_mul(C, ggml_norm(C, x, m.vit_ln_eps), w.n1w), w.n1b);
     ggml_tensor * qkv = ggml_add(C, mm_act(C, w.Wqkv, x_n1, at), w.bqkv);
-    // one cast of the packed QKV rather than three of its slices
-    qkv = as_type(C, qkv, GGML_TYPE_F32);
-    ggml_tensor * q = ggml_cont(C, ggml_view_2d(C, qkv, H, N, qkv->nb[1], 0*H * ggml_element_size(qkv)));
-    ggml_tensor * k = ggml_cont(C, ggml_view_2d(C, qkv, H, N, qkv->nb[1], 1*H * ggml_element_size(qkv)));
-    ggml_tensor * v = ggml_cont(C, ggml_view_2d(C, qkv, H, N, qkv->nb[1], 2*H * ggml_element_size(qkv)));
+
+    const bool split_qkv_types =
+        vla::flash_attn_enabled() &&
+        at == GGML_TYPE_BF16 &&
+        std::getenv("VLA_EVO1_VISION_SPLIT_QKV_TYPES") != nullptr;
+
+    ggml_tensor * q;
+    ggml_tensor * k;
+    ggml_tensor * v;
+
+    if (split_qkv_types) {
+        // Slice the packed BF16 QKV before conversion and produce the types
+        // consumed by the CUDA MMA flash-attention path: F32 Q and F16 K/V.
+        //
+        // Offsets and row stride intentionally come from the original BF16
+        // packed tensor.
+        ggml_tensor * q_bf16 = ggml_cont(C, ggml_view_2d(
+            C, qkv, H, N, qkv->nb[1],
+            0*H * ggml_element_size(qkv)));
+        ggml_tensor * k_bf16 = ggml_cont(C, ggml_view_2d(
+            C, qkv, H, N, qkv->nb[1],
+            1*H * ggml_element_size(qkv)));
+        ggml_tensor * v_bf16 = ggml_cont(C, ggml_view_2d(
+            C, qkv, H, N, qkv->nb[1],
+            2*H * ggml_element_size(qkv)));
+
+        q = as_type(C, q_bf16, GGML_TYPE_F32);
+        k = as_type(C, k_bf16, GGML_TYPE_F16);
+        v = as_type(C, v_bf16, GGML_TYPE_F16);
+    } else {
+        // Existing path: one cast of the packed QKV rather than three slices.
+        qkv = as_type(C, qkv, GGML_TYPE_F32);
+        q = ggml_cont(C, ggml_view_2d(
+            C, qkv, H, N, qkv->nb[1],
+            0*H * ggml_element_size(qkv)));
+        k = ggml_cont(C, ggml_view_2d(
+            C, qkv, H, N, qkv->nb[1],
+            1*H * ggml_element_size(qkv)));
+        v = ggml_cont(C, ggml_view_2d(
+            C, qkv, H, N, qkv->nb[1],
+            2*H * ggml_element_size(qkv)));
+    }
     ggml_tensor * Q_perm = ggml_permute(
         C, ggml_reshape_3d(C, q, hd, n_heads, N),
         0, 2, 1, 3);
