@@ -258,7 +258,64 @@ ggml_tensor * build_internvit_layer(ggml_context * C, const Evo1ModelArch & m, c
     const int64_t H = m.vit_hidden, n_heads = m.vit_heads, hd = H/n_heads;
     const ggml_type at = m.act_type;
     const float scale = 1.0f/std::sqrt((float) hd);
-    ggml_tensor * x_n1 = ggml_add(C, ggml_mul(C, ggml_norm(C, x, m.vit_ln_eps), w.n1w), w.n1b);
+    const bool fused_ln_affine =
+#ifdef GGML_USE_CUDA
+        at == GGML_TYPE_BF16 &&
+        std::getenv("VLA_EVO1_VISION_FUSED_LN_AFFINE") != nullptr;
+#else
+        false;
+#endif
+
+    const bool fused_bias_gelu =
+#ifdef GGML_USE_CUDA
+        at == GGML_TYPE_BF16 &&
+        std::getenv("VLA_EVO1_VISION_FUSED_BIAS_GELU") != nullptr;
+#else
+        false;
+#endif
+
+    auto norm_affine = [&](ggml_tensor * in, ggml_tensor * weight, ggml_tensor * bias) -> ggml_tensor * {
+        ggml_tensor * n = ggml_norm(C, in, m.vit_ln_eps);
+
+        const bool supported_param_types =
+            (weight->type == GGML_TYPE_BF16 || weight->type == GGML_TYPE_F32) &&
+            (bias->type   == GGML_TYPE_BF16 || bias->type   == GGML_TYPE_F32);
+
+        if (fused_ln_affine &&
+            supported_param_types &&
+            ggml_is_contiguous(in) &&
+            ggml_is_contiguous(weight) &&
+            ggml_is_contiguous(bias) &&
+            ggml_nelements(weight) == in->ne[0] &&
+            ggml_nelements(bias)   == in->ne[0]) {
+            // Experimental CUDA extension convention:
+            // NORM src[1] = affine weight, src[2] = affine bias.
+            n->src[1] = weight;
+            n->src[2] = bias;
+            return n;
+        }
+
+        return ggml_add(C, ggml_mul(C, n, weight), bias);
+    };
+
+    auto bias_gelu = [&](ggml_tensor * in, ggml_tensor * bias) -> ggml_tensor * {
+        if (fused_bias_gelu &&
+            (bias->type == GGML_TYPE_BF16 || bias->type == GGML_TYPE_F32) &&
+            ggml_is_contiguous(in) &&
+            ggml_is_contiguous(bias) &&
+            ggml_nelements(bias) == in->ne[0]) {
+            // Experimental CUDA extension convention:
+            // GELU_ERF src[1] = bias. The CUDA kernel preserves the BF16
+            // rounding point of the ordinary ADD before evaluating GELU.
+            ggml_tensor * g = ggml_gelu_erf(C, in);
+            g->src[1] = bias;
+            return g;
+        }
+
+        return ggml_gelu_erf(C, ggml_add(C, in, bias));
+    };
+
+    ggml_tensor * x_n1 = norm_affine(x, w.n1w, w.n1b);
     ggml_tensor * qkv = ggml_add(C, mm_act(C, w.Wqkv, x_n1, at), w.bqkv);
 
     const bool split_qkv_types =
@@ -336,9 +393,8 @@ ggml_tensor * build_internvit_layer(ggml_context * C, const Evo1ModelArch & m, c
     }
     ggml_tensor * attn_out = ggml_add(C, mm_act(C, w.Wproj, as_type(C, att, at), at), w.bproj);
     ggml_tensor * x1 = ggml_add(C, x, ggml_mul(C, attn_out, w.ls1));
-    ggml_tensor * x_n2 = ggml_add(C, ggml_mul(C, ggml_norm(C, x1, m.vit_ln_eps), w.n2w), w.n2b);
-    ggml_tensor * ff = ggml_add(C, mm_act(C, w.Wfc1, x_n2, at), w.bfc1);
-    ff = ggml_gelu_erf(C, ff);
+    ggml_tensor * x_n2 = norm_affine(x1, w.n2w, w.n2b);
+    ggml_tensor * ff = bias_gelu(mm_act(C, w.Wfc1, x_n2, at), w.bfc1);
     ff = ggml_add(C, mm_act(C, w.Wfc2, ff, at), w.bfc2);
     return ggml_add(C, x1, ggml_mul(C, ff, w.ls2));
 }
