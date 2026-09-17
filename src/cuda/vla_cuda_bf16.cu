@@ -500,6 +500,165 @@ bool unary(ggml_tensor * dst, cudaStream_t stream) {
 }
 
 // ---------------------------------------------------------------------------
+// fused bias + GELU_ERF
+// ---------------------------------------------------------------------------
+//
+// Semantics intentionally match two ordinary BF16 graph nodes:
+//
+//   BF16 x + bias -> round to BF16 -> GELU_ERF -> round to BF16.
+//
+// The intermediate BF16 conversion is retained so enabling this fusion does not
+// silently change the activation precision.
+
+template <typename B>
+__global__ void k_bias_gelu_erf_bf16_rows(
+        const __nv_bfloat16 * __restrict__ x,
+        const B * __restrict__ bias,
+        __nv_bfloat16 * __restrict__ dst,
+        const int64_t ne0, const int64_t ne1,
+        const int64_t ne2, const int64_t ne3,
+        const int64_t sx1, const int64_t sx2, const int64_t sx3,
+        const int64_t sd1, const int64_t sd2, const int64_t sd3) {
+    const int64_t i1  = blockIdx.y;
+    const int64_t i23 = blockIdx.z;
+    const int64_t i2  = i23%ne2;
+    const int64_t i3  = i23/ne2;
+
+    const __nv_bfloat16 * __restrict__ xr =
+        x + i1*sx1 + i2*sx2 + i3*sx3;
+    __nv_bfloat16 * __restrict__ dr =
+        dst + i1*sd1 + i2*sd2 + i3*sd3;
+
+    for (int64_t i0=(int64_t)blockIdx.x*blockDim.x+threadIdx.x;
+         i0<ne0;
+         i0+=(int64_t)gridDim.x*blockDim.x) {
+        const __nv_bfloat16 summed =
+            f2bf(bf2f(xr[i0]) + (float)bias[i0]);
+
+        dr[i0] =
+            f2bf(apply_unary<UnOp::GeluErf>(bf2f(summed)));
+    }
+}
+
+template <typename B>
+__global__ void k_bias_gelu_erf_bf16_vec8(
+        const __nv_bfloat16 * __restrict__ x,
+        const B * __restrict__ bias,
+        __nv_bfloat16 * __restrict__ dst,
+        const int64_t ne0, const int64_t ne1,
+        const int64_t ne2, const int64_t ne3,
+        const int64_t sx1, const int64_t sx2, const int64_t sx3,
+        const int64_t sd1, const int64_t sd2, const int64_t sd3) {
+    const int64_t i1  = blockIdx.y;
+    const int64_t i23 = blockIdx.z;
+    const int64_t i2  = i23%ne2;
+    const int64_t i3  = i23/ne2;
+
+    const __nv_bfloat16 * __restrict__ xr =
+        x + i1*sx1 + i2*sx2 + i3*sx3;
+    __nv_bfloat16 * __restrict__ dr =
+        dst + i1*sd1 + i2*sd2 + i3*sd3;
+
+    const int64_t nvec = ne0/8;
+    for (int64_t v=(int64_t)blockIdx.x*blockDim.x+threadIdx.x;
+         v<nvec;
+         v+=(int64_t)gridDim.x*blockDim.x) {
+        const int64_t i0 = 8*v;
+
+        uint4 a = *reinterpret_cast<const uint4 *>(xr+i0);
+        __nv_bfloat16 * av = reinterpret_cast<__nv_bfloat16 *>(&a);
+
+#pragma unroll
+        for (int k=0; k<8; ++k) {
+            const __nv_bfloat16 summed =
+                f2bf(bf2f(av[k]) + (float)bias[i0+k]);
+
+            av[k] =
+                f2bf(apply_unary<UnOp::GeluErf>(bf2f(summed)));
+        }
+
+        *reinterpret_cast<uint4 *>(dr+i0) = a;
+    }
+}
+
+bool bias_gelu_erf(ggml_tensor * dst, cudaStream_t stream) {
+    const ggml_tensor * x    = dst->src[0];
+    const ggml_tensor * bias = dst->src[1];
+
+    if (!x || !bias)
+        return false;
+
+    if (dst->type != GGML_TYPE_BF16 ||
+        x->type   != GGML_TYPE_BF16)
+        return false;
+
+    if (bias->type != GGML_TYPE_BF16 &&
+        bias->type != GGML_TYPE_F32)
+        return false;
+
+    if (!ggml_is_contiguous(x) ||
+        !ggml_is_contiguous(bias) ||
+        !ggml_is_contiguous(dst))
+        return false;
+
+    if (!ggml_are_same_shape(x, dst) ||
+        ggml_nelements(bias) != dst->ne[0])
+        return false;
+
+    const RowGrid g =
+        row_grid(dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3]);
+
+    if (!g.ok)
+        return false;
+
+    const bool vec8 =
+        dst->ne[0]%8 == 0 &&
+        es(x,0) == 1 &&
+        es(dst,0) == 1 &&
+        ((uintptr_t)x->data   % 16) == 0 &&
+        ((uintptr_t)dst->data % 16) == 0;
+
+#define VLA_LAUNCH_BIAS_GELU(TYPE)                                             \
+    do {                                                                        \
+        if (vec8) {                                                             \
+            const int64_t nvec = dst->ne[0]/8;                                 \
+            unsigned bx = 32;                                                   \
+            while (bx < (unsigned)BLOCK && (int64_t)bx < nvec) bx *= 2;        \
+            int64_t gx = (nvec+bx-1)/bx;                                        \
+            if (gx > 65535) gx = 65535;                                         \
+            if (gx < 1) gx = 1;                                                 \
+            const dim3 grid((unsigned)gx, g.grid.y, g.grid.z);                  \
+            const dim3 block(bx, 1, 1);                                         \
+            k_bias_gelu_erf_bf16_vec8<TYPE><<<grid, block, 0, stream>>>(        \
+                (const __nv_bfloat16 *)x->data,                                 \
+                (const TYPE *)bias->data,                                       \
+                (__nv_bfloat16 *)dst->data,                                     \
+                dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],                \
+                es(x,1), es(x,2), es(x,3),                                      \
+                es(dst,1), es(dst,2), es(dst,3));                               \
+        } else {                                                                \
+            k_bias_gelu_erf_bf16_rows<TYPE><<<g.grid, g.block, 0, stream>>>(    \
+                (const __nv_bfloat16 *)x->data,                                 \
+                (const TYPE *)bias->data,                                       \
+                (__nv_bfloat16 *)dst->data,                                     \
+                dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],                \
+                es(x,1), es(x,2), es(x,3),                                      \
+                es(dst,1), es(dst,2), es(dst,3));                               \
+        }                                                                       \
+    } while (0)
+
+    if (bias->type == GGML_TYPE_BF16) {
+        VLA_LAUNCH_BIAS_GELU(__nv_bfloat16);
+    } else {
+        VLA_LAUNCH_BIAS_GELU(float);
+    }
+
+#undef VLA_LAUNCH_BIAS_GELU
+
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // scale: dst = x*scale + bias
 // ---------------------------------------------------------------------------
 
@@ -576,6 +735,105 @@ __global__ void k_norm_bf16(const __nv_bfloat16*__restrict__ x, __nv_bfloat16*__
         for (int64_t c=threadIdx.x; c<ncols; c += blockDim.x)
             dr[c] = f2bf((bf2f(xr[c])-mean)*inv);
     }
+}
+
+template <typename W, typename B>
+__global__ void k_norm_affine_bf16(
+        const __nv_bfloat16 * __restrict__ x,
+        const W * __restrict__ weight,
+        const B * __restrict__ bias,
+        __nv_bfloat16 * __restrict__ dst,
+        const int64_t ncols,
+        const int64_t sx1,
+        const int64_t sd1,
+        const float eps) {
+    __shared__ float shared[BLOCK];
+
+    const int64_t row = blockIdx.x;
+    const __nv_bfloat16 * xr = x   + row*sx1;
+    __nv_bfloat16       * dr = dst + row*sd1;
+
+    float sum = 0.0f;
+    float sumsq = 0.0f;
+
+    for (int64_t c=threadIdx.x; c<ncols; c += blockDim.x) {
+        const float v = bf2f(xr[c]);
+        sum   += v;
+        sumsq += v*v;
+    }
+
+    const float mean = block_sum(sum, shared)/(float) ncols;
+    __syncthreads();
+    const float meansq = block_sum(sumsq, shared)/(float) ncols;
+    const float inv = rsqrtf(meansq - mean*mean + eps);
+
+    for (int64_t c=threadIdx.x; c<ncols; c += blockDim.x) {
+        // Preserve the rounding points of:
+        //   BF16 norm -> BF16 mul -> BF16 add.
+        const __nv_bfloat16 n =
+            f2bf((bf2f(xr[c]) - mean)*inv);
+
+        const __nv_bfloat16 m =
+            f2bf(bf2f(n)*(float) weight[c]);
+
+        dr[c] =
+            f2bf(bf2f(m) + (float) bias[c]);
+    }
+}
+
+bool norm_affine(ggml_tensor * dst, cudaStream_t stream) {
+    const ggml_tensor * src0   = dst->src[0];
+    const ggml_tensor * weight = dst->src[1];
+    const ggml_tensor * bias   = dst->src[2];
+
+    if (!src0 || !weight || !bias)
+        return false;
+
+    if (dst->type != GGML_TYPE_BF16 ||
+        src0->type != GGML_TYPE_BF16)
+        return false;
+
+    if ((weight->type != GGML_TYPE_BF16 && weight->type != GGML_TYPE_F32) ||
+        (bias->type   != GGML_TYPE_BF16 && bias->type   != GGML_TYPE_F32))
+        return false;
+
+    if (!ggml_is_contiguous(src0) ||
+        !ggml_is_contiguous(weight) ||
+        !ggml_is_contiguous(bias) ||
+        !ggml_is_contiguous(dst))
+        return false;
+
+    const int64_t ncols = src0->ne[0];
+    const int64_t nrows = ggml_nelements(src0)/ncols;
+
+    if (ggml_nelements(weight) != ncols ||
+        ggml_nelements(bias)   != ncols ||
+        nrows > 2147483647)
+        return false;
+
+    float eps = 0.0f;
+    memcpy(&eps, dst->op_params, sizeof(float));
+
+#define VLA_LAUNCH_NORM_AFFINE(WTYPE, BTYPE)                                  \
+    k_norm_affine_bf16<WTYPE, BTYPE><<<(int)nrows, BLOCK, 0, stream>>>(       \
+        (const __nv_bfloat16 *) src0->data,                                    \
+        (const WTYPE *) weight->data,                                          \
+        (const BTYPE *) bias->data,                                            \
+        (__nv_bfloat16 *) dst->data,                                           \
+        ncols, ncols, ncols, eps)
+
+    if (weight->type == GGML_TYPE_BF16 && bias->type == GGML_TYPE_BF16) {
+        VLA_LAUNCH_NORM_AFFINE(__nv_bfloat16, __nv_bfloat16);
+    } else if (weight->type == GGML_TYPE_BF16 && bias->type == GGML_TYPE_F32) {
+        VLA_LAUNCH_NORM_AFFINE(__nv_bfloat16, float);
+    } else if (weight->type == GGML_TYPE_F32 && bias->type == GGML_TYPE_BF16) {
+        VLA_LAUNCH_NORM_AFFINE(float, __nv_bfloat16);
+    } else {
+        VLA_LAUNCH_NORM_AFFINE(float, float);
+    }
+
+#undef VLA_LAUNCH_NORM_AFFINE
+    return true;
 }
 
 template <bool rms>
@@ -705,14 +963,32 @@ extern "C" bool vla_cuda_bf16_forward(ggml_tensor * dst, void * stream_v) {
         case GGML_OP_ADD:      return bin_bcast<BinOp::Add>(dst, stream);
         case GGML_OP_MUL:      return bin_bcast<BinOp::Mul>(dst, stream);
         case GGML_OP_SCALE:    return scale(dst, stream);
-        case GGML_OP_NORM:     return norm<false>(dst, stream);
+        case GGML_OP_NORM:
+            if (dst->src[1] != nullptr || dst->src[2] != nullptr) {
+                // Experimental fused NORM + affine node. The graph contains no
+                // downstream MUL/ADD in this case, so failure must not silently
+                // fall through to the ordinary NORM implementation.
+                if (!norm_affine(dst, stream)) {
+                    GGML_ABORT("vla(cuda): unsupported fused BF16 norm-affine node");
+                }
+                return true;
+            }
+            return norm<false>(dst, stream);
         case GGML_OP_RMS_NORM: return norm<true>(dst, stream);
         case GGML_OP_UNARY:
             switch (ggml_get_unary_op(dst)) {
                 case GGML_UNARY_OP_SILU:     return unary<UnOp::Silu>(dst, stream);
                 case GGML_UNARY_OP_RELU:     return unary<UnOp::Relu>(dst, stream);
                 case GGML_UNARY_OP_GELU:     return unary<UnOp::Gelu>(dst, stream);
-                case GGML_UNARY_OP_GELU_ERF: return unary<UnOp::GeluErf>(dst, stream);
+                case GGML_UNARY_OP_GELU_ERF:
+                    if (dst->src[1] != nullptr) {
+                        // Fused bias+GELU graph node has no preceding ADD node.
+                        if (!bias_gelu_erf(dst, stream)) {
+                            GGML_ABORT("vla(cuda): unsupported fused BF16 bias+GELU node");
+                        }
+                        return true;
+                    }
+                    return unary<UnOp::GeluErf>(dst, stream);
                 default: return false;
             }
         default: return false;
